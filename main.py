@@ -1,13 +1,18 @@
 import os
 import threading
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from datetime import date
 import time
 import random
-
+from io import BytesIO
+from PIL import Image
 import requests
 import telebot
 from telebot import types
 from dotenv import load_dotenv
+from staticmap import StaticMap, CircleMarker
 load_dotenv()
 
 token = os.getenv("TOKEN")
@@ -47,22 +52,83 @@ FAKE_QUAKES = [
     }
 ]
 
+
+
+def generate_quake_map(quakes, center=(43.24, 76.89), zoom=6, size=(800, 600)):
+    m = StaticMap(size[0], size[1], url_template='http://a.tile.openstreetmap.org/{z}/{x}/{y}.png')
+
+    for quake in quakes:
+        lat = float(quake['lat'])
+        lon = float(quake['lon'])
+        mag = float(quake['mag'])
+        color = 'red' if mag >= 5 else 'orange' if mag >= 4 else 'yellow'
+        radius = 6 + int(mag * 2)
+        marker = CircleMarker((lon, lat), color, radius)
+        m.add_marker(marker)
+
+
+    image = m.render(zoom=zoom, center=(float(center[1]), float(center[0])))
+    img_bytes = BytesIO()
+    image.save(img_bytes, format='PNG')
+    img_bytes.seek(0)
+    return img_bytes
+
+    map_data = m._to_png(5)
+    img = Image.open(BytesIO(map_data))
+    output = BytesIO()
+    img.save(output, format="PNG")
+    output.seek(0)
+    return output
+
+
+def generate_user_location_map(lat, lon, zoom=10, size=(800, 600)):
+    m = StaticMap(
+        size[0],
+        size[1],
+        url_template='http://a.tile.openstreetmap.org/{z}/{x}/{y}.png'
+    )
+
+    marker = CircleMarker((lon, lat), 'blue', 12)
+    m.add_marker(marker)
+
+    image = m.render(zoom=zoom, center=(lon, lat))
+    img_bytes = BytesIO()
+    image.save(img_bytes, format='PNG')
+    img_bytes.seek(0)
+
+    return img_bytes
+
+
+
 def fake_alerts():
     while True:
         for chat_id, enabled in user_alert_enabled.items():
-            if enabled:
-                lat, lon = user_location.get(chat_id,(43.24,76.89))
-                minmag = user_min_mag.get(chat_id,2)
+            if not enabled:
+                continue
 
-                quakes = [q for q in FAKE_QUAKES if float(q["mag"]) >= minmag]
+            lat, lon = user_location.get(chat_id, (43.24, 76.89))
+            lat, lon = float(lat), float(lon)
+            minmag = user_min_mag.get(chat_id, 2)
 
-                for quake in quakes:
-                    bot.send_message(chat_id,
-                                     f"ВНИМАНИЕ! Симулированное землетрясение:\n"
-                                     f"Магнитуда{quake['mag']} - {quake['place']}\n"
-                                     f"Глубина: {quake['depth']} km\n"
-                                     f"Координаты: {quake['lat']},{quake['lon']}\n"
-                                     f"Посмотреть на карте: https://www.google.com/maps/search/?api=1&query={quake['lat']},{quake['lon']}")
+            quakes = [q for q in FAKE_QUAKES if float(q["mag"]) >= minmag]
+
+            if not quakes:
+                continue
+
+            text = "Симулированное землетрясение\n\n"
+            for quake in quakes[:5]:
+                text += (
+                    f"{quake['mag']} | {quake['place']}\n"
+                    f"{quake['depth']} км\n\n"
+                )
+
+            map_image = generate_quake_map(quakes, center=(lat, lon))
+
+            bot.send_photo(
+                chat_id,
+                map_image,
+                caption=text
+            )
 
         time.sleep(60)
 
@@ -103,7 +169,6 @@ def help(message):
                                      '/alert_on - Включить уведомления\n'
                                      '/prepare - Советы как действовать при землетрясениях\n'
                                      '/map - Показать карту последних землетрясений\n'
-                                     '/quake_risk - Риск землетрясений\n'
                                      '/stats - Статистика землетрясений'
                      )
 
@@ -111,29 +176,45 @@ def help(message):
 def earthquake_today(message):
     minmag = user_min_mag.get(message.chat.id, 2)
 
-    if message.chat.id in user_location:
-        lat,lon = user_location[message.chat.id]
-    else:
-        lat,lon = 43.24,76.89
+
+    lat, lon = user_location.get(message.chat.id, (43.24, 76.89))
+    lat, lon = float(lat), float(lon)
+
     quakes = get_quakes(lat, lon, minmag)
 
     if not quakes:
-        bot.send_message(message.chat.id,"Землетрясений нет")
+        bot.send_message(message.chat.id, "Сегодня землетрясений не зафиксировано")
         return
 
-    text = "Сегодняшние землетрясения: "
-    for quake in quakes:
-        text += f"Mагнитуда {quake['mag']} - {quake['place']}\n"
 
-    bot.send_message(message.chat.id, text)
+    text = "Сегодняшние землетрясения:\n\n"
+    for quake in quakes:
+        text += (
+            f"Магнитуда: {quake['mag']}\n"
+            f"{quake['place']}\n"
+            f"Глубина: {quake['depth']} км\n\n"
+        )
+
+
+    map_image = generate_quake_map(quakes, center=(lat, lon))
+
+
+    bot.send_photo(
+        message.chat.id,
+        map_image,
+        caption=text
+    )
 
 
 @bot.message_handler(commands=['my_location'])
 def my_location(message):
+    chat_id = message.chat.id
 
     if message.chat.id in user_location:
         lat, lon = user_location[message.chat.id]
-        bot.send_message(message.chat.id,f'Сохраненная локация: {lat},{lon}')
+        caption = (f'Сохраненная локация: {lat},{lon}')
+        map_image = generate_user_location_map(lat, lon)
+        bot.send_photo(chat_id, map_image, caption=caption)
         return
 
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -144,32 +225,89 @@ def my_location(message):
 
 @bot.message_handler(content_types=['location'])
 def location(message):
-    lat = message.location.latitude
-    lon = message.location.longitude
+    lat = float(message.location.latitude)
+    lon = float(message.location.longitude)
 
-    user_location[message.chat.id] = lat,lon
-    user_min_mag[message.chat.id] = True
+    user_location[message.chat.id] = (lat, lon)
+    user_min_mag[message.chat.id] = 2
 
-    bot.send_message(message.chat.id,f'Локация сохранена: {lat},{lon}',
-                     reply_markup=types.ReplyKeyboardRemove())
+    map_image = generate_user_location_map(lat, lon)
+
+    caption = (
+        "Ваша локация сохранена\n\n"
+        f"Координаты:\n"
+        f"Широта: {lat}\n"
+        f"Долгота: {lon}"
+    )
+
+    bot.send_photo(
+        message.chat.id,
+        map_image,
+        caption=caption,
+        reply_markup=types.ReplyKeyboardRemove()
+    )
 
 @bot.message_handler(commands=['alert_on'])
 def alert_on(message):
-    user_alert_enabled[message.chat.id] = True
-
+    
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(types.KeyboardButton("Включить уведомления"),types.KeyboardButton("Выключить уведомления"))
+    keyboard.add(
+        types.KeyboardButton("Включить уведомления"),
+        types.KeyboardButton("Выключить уведомления")
+    )
 
-    bot.send_message(message.chat.id,"Настройка уведомлений",reply_markup=keyboard)
+    bot.send_message(
+        message.chat.id,
+        "Настройка уведомлений. Выберите действие:",
+        reply_markup=keyboard
+    )
 
-@bot.message_handler(func=lambda message: message.text in ["Включить уведомления","Выключить уведомления"])
-def btn(message):
+
+@bot.message_handler(func=lambda message: message.text in ["Включить уведомления", "Выключить уведомления"])
+def handle_alert_buttons(message):
+    chat_id = message.chat.id
+
     if message.text == "Включить уведомления":
-        user_alert_enabled[message.chat.id] = True
-        bot.send_message(message.chat.id,"Уведомления включены",reply_markup=types.ReplyKeyboardRemove())
+        user_alert_enabled[chat_id] = True
+
+        lat, lon = user_location.get(chat_id, (43.24, 76.89))
+        lat, lon = float(lat), float(lon)
+        minmag = user_min_mag.get(chat_id, 2)
+
+        quakes = get_quakes(lat, lon, minmag)
+
+        if not quakes:
+            bot.send_message(
+                chat_id,
+                "Уведомления включены.\nНа данный момент землетрясений в вашем регионе нет.",
+                reply_markup=types.ReplyKeyboardRemove()
+            )
+            return
+
+        text = "Уведомления включены\n\nПоследние землетрясения:\n\n"
+        for quake in quakes[:5]:
+            text += (
+                f"Магнитуда: {quake['mag']}\n"
+                f"{quake['place']}\n"
+                f"Глубина: {quake['depth']} км\n\n"
+            )
+
+        map_image = generate_quake_map(quakes, center=(lat, lon))
+
+        bot.send_photo(
+            chat_id,
+            map_image,
+            caption=text,
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+
     elif message.text == "Выключить уведомления":
-        user_alert_enabled[message.chat.id] = False
-        bot.send_message(message.chat.id,"Уведомления выключены",reply_markup=types.ReplyKeyboardRemove())
+        user_alert_enabled[chat_id] = False
+        bot.send_message(
+            chat_id,
+            "Уведомления выключены",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
 
 
 @bot.message_handler(commands=['prepare'])
@@ -187,103 +325,58 @@ def prepare(message):
 
 
 @bot.message_handler(commands=['map'])
-def map(message):
+def show_map(message):
+    lat, lon = user_location.get(message.chat.id, (43.24, 76.89))
+    lat, lon = float(lat), float(lon)
     minmag = user_min_mag.get(message.chat.id, 2)
-
-    if message.chat.id in user_location:
-        lat,lon = user_location[message.chat.id]
-    else:
-        lat,lon = 43.24,76.89
-
     quakes = get_quakes(lat, lon, minmag)
 
-    if not quakes:
-        bot.send_message(message.chat.id,"Землетрясений нет")
-        return
-
-    text = "Последние землетрясения:\n\n"
-    for quake in quakes[:10]:
-        text += f"Магнитуда {quake['mag']} - {quake['place']} (Глубина : {quake['depth']} km) \n"
-
-    map_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-    text += f"Посмотреть на карте: {map_url}"
-
-    bot.send_message(message.chat.id,text)
-
-
-@bot.message_handler(commands=['quake_risk'])
-def quake_risk(message):
-    minmag = user_min_mag.get(message.chat.id, 2)
-
-    if message.chat.id in user_location:
-        lat, lon = user_location[message.chat.id]
-    else:
-        lat, lon = 43.24, 76.89
-
-    quakes = get_quakes(lat, lon, minmag)
-    if not quakes:
-        bot.send_message(message.chat.id,"Землетрясений нет")
-        return
-
-    mags = [float(q['mag'])for q in quakes]
-    max_mag = max(mags)
-    avg_mag = sum(mags) / len(mags)
-    count = len(quakes)
-
-    avg_mag = round(avg_mag)
-    if max_mag >= 5 or count >= 3:
-        risk = "Высокий"
-    elif max_mag >= 4 or count == 2:
-        risk = "Средний"
-    else:
-        risk = "Низкий"
-
-
-    text = (f"Оценка риска для вашего региона: \n\n"
-            f"Количество землетрясений: {count}\n"
-            f"Максимальная магнитуда: {max_mag}\n"
-            f"Средняя магнитуда: {avg_mag}\n"
-            f"Риск: {risk}")
-
-    bot.send_message(message.chat.id,text)
-
-
-@bot.message_handler(commands=['stats'])
-def stats(message):
-    minmag = user_min_mag.get(message.chat.id, 2)
-
-    if message.chat.id in user_location:
-        lat, lon = user_location[message.chat.id]
-    else:
-        lat, lon = 43.24, 76.89
-
-    quakes = get_quakes(lat, lon, minmag)
     if not quakes:
         bot.send_message(message.chat.id, "Землетрясений нет")
         return
 
+    map_image = generate_quake_map(quakes, center=(lat, lon))
+    bot.send_photo(message.chat.id, map_image, caption="Последние землетрясения (цвет маркера зависит от магнитуды)")
+
+
+@bot.message_handler(commands=['stats'])
+def quake_stats(message):
+    chat_id = message.chat.id
+    minmag = user_min_mag.get(chat_id, 2)
+    lat, lon = user_location.get(chat_id, (43.24, 76.89))
+    lat, lon = float(lat), float(lon)
+
+    quakes = get_quakes(lat, lon, minmag)
+    if not quakes:
+        bot.send_message(chat_id, "Землетрясений нет")
+        return
+
+    lats = [float(q['lat']) for q in quakes]
+    lons = [float(q['lon']) for q in quakes]
     mags = [float(q['mag']) for q in quakes]
-    max_mag = max(mags)
-    avg_mag = sum(mags) / len(mags)
-    count = len(quakes)
+    places = [q['place'] for q in quakes]
 
-    avg_mag = round(avg_mag)
-    if max_mag >= 5 or count >= 3:
-        risk = "Высокий"
-    elif max_mag >= 4 or count == 2:
-        risk = "Средний"
-    else:
-        risk = "Низкий"
+    plt.figure(figsize=(8,6))
+    plt.scatter(lons, lats, c=mags, s=[m*20 for m in mags],
+                cmap='hot', alpha=0.6, edgecolors='k')
+    plt.colorbar(label='Магнитуда')
+    plt.title('Статистика землетрясений')
+    plt.xlabel('Долгота')
+    plt.ylabel('Широта')
+    plt.xlim(min(lons)-0.1, max(lons)+0.1)
+    plt.ylim(min(lats)-0.1, max(lats)+0.1)
+    plt.grid(True, alpha=0.3)
 
-    text = (f"Статистика землетрясений: \n\n"
-            f"Количество землетрясений: {count}\n"
-            f"Максимальная магнитуда: {max_mag}\n"
-            f"Средняя магнитуда: {avg_mag}\n"
-            f"Риск: {risk}\n"
-            f"Соберите документы и предметы первой необходимости,на всякий случай,в вашем регионе уже {count} зарегистрированных случая")
+    for i, place in enumerate(places):
+        plt.text(lons[i], lats[i], place, fontsize=8, ha='left', va='bottom', alpha=0.7)
 
+    buf = BytesIO()
+    plt.savefig(buf, format='PNG', bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
 
-    bot.send_message(message.chat.id,text)
+    bot.send_photo(chat_id, buf, caption="Статистика землетрясений в вашем регионе")
+
 
 threading.Thread(target=fake_alerts, daemon=True).start()
 
